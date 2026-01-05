@@ -14,6 +14,9 @@ use tokio::task;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Channel;
 
+// FIX: 引入 dirs crate 依赖
+use dirs;
+
 // 从原 src/client.rs 复制
 const CHUNK_SIZE: usize = 1024 * 64; // 64 KB
 
@@ -112,30 +115,91 @@ pub async fn list_remote_dir(
     }
 }
 
-/// 3. 上传文件 (核心逻辑源自原 src/client.rs::upload_file)
+// 3. 上传文件 (核心逻辑源自原 src/client.rs::upload_file)
 #[tauri::command]
 pub async fn upload_local_file(
     state: State<'_, ClientState>,
     local_path: String,
     target_dir: String,
 ) -> Result<String, String> {
-    let mut client = state.get_client().map_err(|e| e.message().to_string())?;
+    // [LOG A: 初始日志]
+    info!(
+        "upload_local_file attempt from {:?} to {:?}",
+        &local_path, &target_dir
+    );
 
-    let path = Path::new(&local_path);
-    let filename = path
+    // 1. 获取 gRPC 客户端
+    let mut client = state.get_client().map_err(|e| {
+        error!(
+            "UPLOAD ERROR (Step 1): Failed to get gRPC client. Status: {}",
+            e.message()
+        );
+        e.message().to_string()
+    })?;
+
+    // 2. 验证本地文件路径和提取文件名
+
+    // FIX START: 强制修正路径逻辑
+    let home_dir = dirs::home_dir().ok_or_else(|| {
+        error!("UPLOAD ERROR (Step 2.1): Could not determine user home directory.");
+        "无法确定用户主目录".to_string()
+    })?;
+
+    let relative_path = Path::new(&local_path);
+
+    // 尝试移除路径前导的 '/'，如果存在的话，确保路径是相对于 Home 目录的。
+    let corrected_path = if let Ok(stripped) = relative_path.strip_prefix("/") {
+        stripped
+    } else if let Ok(stripped) = relative_path.strip_prefix("\\") {
+        // 兼容 Windows 路径
+        stripped
+    } else {
+        relative_path
+    };
+
+    // 最终的绝对路径 = Home 目录 + 修正后的相对路径
+    let actual_path = home_dir.join(corrected_path);
+
+    info!("Path constructed: {:?}", actual_path);
+    // FIX END
+
+    let filename = actual_path
         .file_name()
-        .ok_or_else(|| "本地文件路径无效或缺少文件名".to_string())?
+        .ok_or_else(|| {
+            error!(
+                "UPLOAD ERROR (Step 2): Local path invalid or missing filename: {:?}",
+                actual_path
+            );
+            "本地文件路径无效或缺少文件名".to_string()
+        })?
         .to_string_lossy()
         .into_owned();
 
-    let file = File::open(path).map_err(|e| format!("打开本地文件失败: {}", e))?;
+    // 3. 打开本地文件
+    // 在主异步函数中打开文件，以进行错误处理
+    let file = std::fs::File::open(&actual_path).map_err(|e| {
+        error!(
+            "UPLOAD ERROR (Step 3): Failed to open local file {:?}. Error: {}",
+            actual_path, e
+        );
+        format!("打开本地文件失败: {}", e)
+    })?;
 
-    let (tx, rx) = mpsc::channel(4);
+    // (tx_main, rx) - 主线程持有 tx_main
+    let (tx_main, rx) = mpsc::channel(4);
 
     let filename_owned = filename.clone();
     let target_dir_owned = target_dir.to_string();
 
-    // Spawn a blocking task to handle standard library File I/O
+    // 将 tx_main 克隆给 spawn_blocking 任务
+    let tx_blocking = tx_main.clone();
+
+    let file_size = file.metadata().map(|m| m.len()).unwrap_or(0);
+
+    // [LOG B: 文件信息日志]
+    info!("Starting upload for: {} ({} bytes)", filename, file_size);
+
+    // 4. 启动阻塞任务进行 I/O
     task::spawn_blocking(move || {
         let mut file = file;
         let mut buffer = vec![0u8; CHUNK_SIZE];
@@ -149,10 +213,16 @@ pub async fn upload_local_file(
                 }
                 Ok(n) => n,
                 Err(e) => {
-                    error!("Failed to read local file: {}", e);
+                    error!(
+                        "UPLOAD ERROR (Step 4.1): Failed to read local file chunk: {}",
+                        e
+                    );
+                    // 如果读取失败，也应该 break，让 tx_blocking 自动 drop
                     break;
                 }
             };
+
+            // ... (chunk 构造逻辑不变) ...
 
             let chunk_data = if bytes_read > 0 {
                 &buffer[..bytes_read]
@@ -168,8 +238,9 @@ pub async fn upload_local_file(
             };
 
             // Use blocking_send inside spawn_blocking
-            if tx.blocking_send(chunk).is_err() {
-                error!("Failed to send chunk to gRPC stream (receiver closed)");
+            if tx_blocking.blocking_send(chunk).is_err() {
+                // 这个错误通常是因为接收端 rx 提前关闭，这意味着 gRPC 调用已经失败或取消
+                error!("UPLOAD ERROR (Step 4.2): Failed to send chunk to gRPC stream (receiver closed)");
                 break;
             }
 
@@ -177,22 +248,33 @@ pub async fn upload_local_file(
                 break;
             }
         }
+        // 当此 spawn_blocking 任务结束时，tx_blocking 被 drop
     });
+
+    // 5. 丢弃主线程的 Sender，允许流终止
+    drop(tx_main);
 
     let request_stream = tonic::Request::new(ReceiverStream::new(rx));
 
-    // Send the stream to the server
+    // 6. 发起 gRPC 调用
     match client.upload_file(request_stream).await {
         Ok(response) => {
             let inner = response.into_inner();
             if inner.success {
+                info!("UPLOAD SUCCESS: Server returned success status.");
                 Ok(format!("✅ 上传成功: {}", inner.message))
             } else {
+                // 如果服务器返回 success: false
+                error!(
+                    "UPLOAD FAILED (Step 6.1): Server returned failure status: {}",
+                    inner.message
+                );
                 Err(format!("❌ 上传失败: {}", inner.message))
             }
         }
         Err(e) => {
-            error!("gRPC call failed while uploading file: {}", e);
+            // gRPC 调用失败，可能是网络问题或服务器内部错误
+            error!("UPLOAD FAILED (Step 6.2): gRPC call failed. Error: {}", e);
             Err(format!("gRPC 调用失败: {}", e.message()))
         }
     }

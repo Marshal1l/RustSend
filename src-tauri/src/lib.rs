@@ -7,13 +7,12 @@ use log::{error, info};
 // 引入 ClientState 和 gRPC 命令
 use crate::grpc_client::{connect_server, list_remote_dir, upload_local_file, ClientState};
 // 引入 Tauri 的专用异步运行时
-use tauri::{async_runtime, Emitter}; // <-- 新增!
-
-// 确保您的 server 和 client 模块已被引入
+use crate::commands::list_local_dir;
+use tauri::{async_runtime, Emitter};
+mod commands;
 mod grpc_client;
 mod server;
 mod server_starter;
-
 // 引入 gRPC 结构 (如果未通过 build.rs 引入)
 pub mod filerpc {
     tonic::include_proto!("filerpc");
@@ -27,8 +26,6 @@ fn greet(name: &str) -> String {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    env_logger::init();
-
     // ----------------------------------------------------------------------
     // 核心修改：使用 tauri::async_runtime::spawn 替换所有 tokio::spawn
     // ----------------------------------------------------------------------
@@ -58,6 +55,7 @@ pub fn run() {
             connect_server,
             list_remote_dir,
             upload_local_file,
+            list_local_dir,
             greet
         ])
         .run(tauri::generate_context!())

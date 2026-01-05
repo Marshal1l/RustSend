@@ -41,3 +41,4 @@ tokio-stream = "0.1.17"
 tonic = { version = "0.14.2" }
 tonic-prost = "0.14.2"
 uuid = { version = "1.19.0", features = ["v4"] }
+dirs = "6.0.0"

@@ -1,14 +1,13 @@
 // src/server.rs
 
+use dashmap::DashMap;
+use dirs;
 use log::{error, info, warn};
-use std::path::PathBuf;
-use std::sync::Arc; // Needed for Arc<DashMap>
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use tonic::{Request, Response, Status};
-
-// FIX: Added DashMap for fine-grained concurrent access control
-use dashmap::DashMap;
 
 // Includes the auto-generated gRPC code
 pub mod filerpc {
@@ -20,8 +19,6 @@ use filerpc::{
 };
 
 // --- Static Path Lock Manager ---
-// This DashMap holds the canonical paths of all files currently being written to.
-// The key is the canonical PathBuf, and the value is a placeholder ().
 type PathLockMap = Arc<DashMap<PathBuf, ()>>;
 
 // --- FileService Implementation Struct ---
@@ -36,8 +33,14 @@ pub struct MyFileService {
 // Custom implementation of Default to initialize base_path
 impl Default for MyFileService {
     fn default() -> Self {
+        let default_base_path = match dirs::home_dir() {
+            Some(path) => path,
+            None => PathBuf::from("/tmp"), // 使用 /tmp 作为最后的 fallback
+        };
+
         MyFileService {
-            base_path: PathBuf::from("data"),
+            // 确保 default 也使用 Home 目录
+            base_path: default_base_path,
             active_uploads: Arc::new(DashMap::new()),
         }
     }
@@ -67,7 +70,6 @@ impl FileService for MyFileService {
         let mut file_data: Option<fs::File> = None;
         let mut bytes_written = 0;
 
-        // This will hold the canonical path used for locking
         let mut canonical_final_path: Option<PathBuf> = None;
 
         while let Some(chunk) = stream.message().await? {
@@ -77,12 +79,18 @@ impl FileService for MyFileService {
                     return Err(Status::invalid_argument("Filename cannot be empty"));
                 }
 
-                let upload_dir = self.base_path.join(&chunk.target_dir);
+                // --- FIX START: 路径拼接修正 ---
+                // 客户端发来的 target_dir 可能包含前导 '/'，这将导致 PathBuf::join 覆盖 self.base_path。
+                let target_rel_path = chunk.target_dir.trim_start_matches('/');
+
+                let upload_dir = self.base_path.join(target_rel_path);
                 let final_path = upload_dir.join(&chunk.filename);
+                // --- FIX END ---
 
                 // --- CONCURRENCY LOCK START ---
 
                 // 1. Calculate the canonical path for robust locking
+                // 尝试规范化路径，如果失败（例如目录不存在），则使用原始路径
                 let path_to_lock = final_path.canonicalize().unwrap_or(final_path.clone());
 
                 // 2. Try to insert into the DashMap. If it returns Some, the path is already locked.
@@ -157,10 +165,6 @@ impl FileService for MyFileService {
         }
 
         // --- CONCURRENCY LOCK RELEASE ---
-        // Ensure the lock is released after successful upload, regardless of how the function exits (via Ok or early ?).
-        // Since we are using an asynchronous context, we MUST remove the lock explicitly here,
-        // as a standard RAII guard would require complex wrappers (like scopeguard::guard)
-        // that are difficult to manage with async code returning Result.
         if let Some(p) = canonical_final_path.as_ref() {
             self.active_uploads.remove(p);
         } else {
@@ -193,18 +197,25 @@ impl FileService for MyFileService {
         request: Request<ListDirRequest>,
     ) -> Result<Response<ListDirResponse>, Status> {
         let req = request.into_inner();
-        let path_str = req.path;
+        let path_str = req.path; // 客户端请求的路径，例如 "/" 或 "Documents/Photos"
 
-        // Use the base_path from the struct
-        let full_path = self.base_path.join(&path_str);
+        // --- FIX START: 路径构建修正 ---
+        let mut full_path = self.base_path.clone();
 
-        // Security check: Canonicalize and verify path is still under the base directory
-        let canonical_base = self
-            .base_path
-            .canonicalize()
-            .map_err(|_| Status::internal("Server base directory is invalid"))?;
+        // 如果客户端请求的不是根路径，则将其附加到 base_path
+        if path_str != "/" && !path_str.is_empty() {
+            // 移除前导的 '/'，确保路径被正确地 join 到 base_path 后面
+            full_path.push(path_str.trim_start_matches('/'));
+        }
+        // --- FIX END ---
 
-        // Canonicalize the requested path
+        // 1. 规范化 base_path (沙箱根目录)
+        let canonical_base = self.base_path.canonicalize().map_err(|e| {
+            error!("Failed to canonicalize server base path: {}", e);
+            Status::internal("Server base directory is invalid or inaccessible")
+        })?;
+
+        // 2. 规范化请求路径
         let canonical_path = full_path.canonicalize().map_err(|e| {
             warn!(
                 "Directory query failed (path invalid/not found): {} -> {}",
@@ -213,11 +224,13 @@ impl FileService for MyFileService {
             Status::not_found(format!("Directory not found or inaccessible: {}", path_str))
         })?;
 
-        // Path traversal check
+        // --- 修复点 B: 路径遍历检查 (沙箱机制) ---
+        // 检查 canonical_path 是否以 canonical_base 开头。
         if !canonical_path.starts_with(&canonical_base) {
             error!(
-                "Path traversal attempt detected: {}",
-                canonical_path.display()
+                "Path traversal attempt detected: {} (Base: {})",
+                canonical_path.display(),
+                canonical_base.display()
             );
             return Err(Status::permission_denied("Access to this path is denied"));
         }
@@ -226,14 +239,14 @@ impl FileService for MyFileService {
 
         let mut entries = Vec::new();
 
-        // FIX: Use tokio::fs::read_dir (asynchronous)
-        match fs::read_dir(&canonical_path).await {
+        // FIX: 使用 tokio::fs::read_dir 异步读取目录
+        match tokio::fs::read_dir(&canonical_path).await {
             Ok(mut dir) => {
-                // FIX: Iterate using async iteration
+                // FIX: 迭代使用 async iteration
                 while let Some(entry_result) = dir.next_entry().await.transpose() {
                     match entry_result {
                         Ok(entry) => {
-                            // FIX: Use entry.metadata().await (asynchronous)
+                            // FIX: 使用 entry.metadata().await 异步获取元数据
                             let metadata = entry.metadata().await.map_err(|e| {
                                 error!("Failed to get directory entry metadata: {}", e);
                                 Status::internal("Could not get file metadata")

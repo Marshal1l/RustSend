@@ -3344,6 +3344,7 @@ dependencies = [
  "anyhow",
  "clap",
  "dashmap",
+ "dirs",
  "env_logger",
  "futures",
  "log",
