@@ -1,0 +1,32 @@
+syntax = "proto3";
+
+package filerpc;
+
+service FileService {
+  // 1. 流式上传单个文件
+  rpc UploadFile(stream FileChunk) returns (UploadStatus);
+
+  // 2. 查询目录结构
+  rpc ListDir(ListDirRequest) returns (ListDirResponse);
+}
+
+message FileChunk {
+  string filename = 1;
+  string target_dir = 2;
+  bytes data = 3;
+  bool eof = 4;
+}
+
+message UploadStatus {
+  bool success = 1;
+  string message = 2;
+}
+
+message ListDirRequest { string path = 1; }
+
+message DirEntry {
+  string name = 1;
+  bool is_dir = 2;
+}
+
+message ListDirResponse { repeated DirEntry entries = 1; }
